@@ -10,6 +10,7 @@ from datasets import load_dataset
 from tokenizer import TOKENIZER, INV_TOKENIZER, tokenize_string_random
 from models import VoiceEncoder, TextEncoder, AudioModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
+import random
 
 
 class LibriSpeechDataset(Dataset):
@@ -23,15 +24,24 @@ class LibriSpeechDataset(Dataset):
     def __getitem__(self, index):
         item = self.dataset[index]
         audio_array = item['audio']['array'].astype(np.float32)
-
         transcription = self.transcriptions.get(item['id'], '')
         transcription = tokenize_string_random(transcription, TOKENIZER)
-
+        
+        # Select a random snippet of the audio
+        audio_length = len(audio_array)
+        if audio_length <= 16000:
+            audio_snippet = audio_array
+        else:
+            snippet_length = random.randint(16000, audio_length)
+            start_idx = random.randint(0, audio_length - snippet_length)
+            end_idx = start_idx + snippet_length
+            audio_snippet = audio_array[start_idx:end_idx]
+        
         audio_array = torch.tensor(audio_array)
-
+        audio_snippet = torch.tensor(audio_snippet)
         transcription = torch.tensor(transcription, dtype=torch.long)
 
-        return audio_array, transcription
+        return audio_array, transcription, audio_snippet
 
     def load_transcriptions(self):
         transcriptions = {}
@@ -42,44 +52,98 @@ class LibriSpeechDataset(Dataset):
         return transcriptions
 
 def pad_collate(batch):
-    lengths = [sample[0].size()[0] for sample in batch]
-    max_length = max(lengths)
+    audio_lengths = [sample[0].size(0) for sample in batch]
+    max_audio_length = max(audio_lengths)
     
-    padded_batch = torch.zeros(len(batch), max_length)
-    for i, sample in enumerate(batch):
-        padded_batch[i, :lengths[i]] = sample[0]
+    audio_padding_size = 1000 - (max_audio_length % 1000)  # subtracting remainder from 1000
+    padded_audio_length = max_audio_length + audio_padding_size
+    padded_audio = torch.zeros(len(batch), padded_audio_length, dtype=torch.float32)
+    for i, (audio, _, _) in enumerate(batch):
+        padded_audio[i, :audio_lengths[i]] = audio
+    padded_audio = padded_audio.view(len(batch), -1, 1000)
+
+    text_lengths = [sample[1].size(0) for sample in batch]
+    max_text_length = max(text_lengths)
+    padded_text = torch.zeros(len(batch), max_text_length, dtype=torch.long)
+    for i, (_, text, _) in enumerate(batch):
+        padded_text[i, :text_lengths[i]] = text
+
+    snippet_lengths = [sample[2].size(0) for sample in batch]
+    max_snippet_length = max(snippet_lengths)
     
-    return padded_batch, lengths
+    snippet_padding_size = 1000 - (max_snippet_length % 1000)  # subtracting remainder from 1000
+    padded_snippet_length = max_snippet_length + snippet_padding_size
+    padded_snippet = torch.zeros(len(batch), padded_snippet_length, dtype=torch.float32)
+    for i, (_, _, snippet) in enumerate(batch):
+        padded_snippet[i, :snippet_lengths[i]] = snippet
+    padded_snippet = padded_snippet.view(len(batch), -1, 1000)
+    
+    # calculate lengths after splitting into 1000-sample tokens
+    audio_lengths = [(audio_length - 1) // 1000 + 1 for audio_length in audio_lengths]
+    snippet_lengths = [(snippet_length - 1) // 1000 + 1 for snippet_length in snippet_lengths]
+
+    return (padded_audio, padded_text, padded_snippet), (audio_lengths, text_lengths, snippet_lengths)
 
 if __name__ == '__main__':
 
-    noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+    voice_encoder = VoiceEncoder(d_model=384, nhead=6, num_layers=4).cuda()
+    text_encoder = TextEncoder(d_model=384, nhead=6, num_layers=4).cuda()
+    audio_model = AudioModel(voice_encoder, text_encoder, d_model=384, nhead=6, num_layers=4).cuda()
 
-    voice_encoder = VoiceEncoder(d_model=384, nhead=6, num_layers=4)
-    text_encoder = TextEncoder(d_model=384, nhead=6, num_layers=4)
-    audio_model = AudioModel(voice_encoder, text_encoder, d_model=384, nhead=6, num_layers=4)
-
-    BATCH_SIZE = 128
+    BATCH_SIZE = 64
     PEAK_LEARNING_RATE = 1e-4
     NUM_EPOCHS = 100
+    
+    dataset = LibriSpeechDataset("train.clean.100")
 
-    class MyDataset(data.Dataset):
-        def __init__(self):
-            self.data = np.random.randn(1000, 1600).astype(np.float32)
-        
-        def __len__(self):
-            return len(self.data)
-        
-        def __getitem__(self, idx):
-            return self.data[idx]
-        
-    dataset = MyDataset("train.clean.100")
+    train_dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate)
 
-    train_dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-    optimizer = torch.optim.AdamW(audio_model.parameters() + voice_encoder.parameters() + text_encoder.parameters(), lr=PEAK_LEARNING_RATE)
+    optimizer = torch.optim.AdamW(
+        list(audio_model.parameters()) + list(voice_encoder.parameters()) + list(text_encoder.parameters())
+    , lr=PEAK_LEARNING_RATE)
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=1000,
         num_training_steps=(len(train_dataloader) * NUM_EPOCHS),
     )
+
+    noise_scheduler = DDPMScheduler(num_train_timesteps=1000)
+
+    voice_encoder.train()
+    text_encoder.train()
+    audio_model.train()
+
+    for epoch in range(NUM_EPOCHS):
+        for i_step, (batch, batch_lengths) in enumerate(train_dataloader):
+            audio_data, text_data, audio_snippets = batch
+            audio_lengths, text_lengths, snippet_lengths = batch_lengths
+
+            audio_mask = torch.arange(audio_data.size(1)).expand(len(audio_lengths), audio_data.size(1)) >= torch.tensor(audio_lengths).unsqueeze(1)
+            text_mask = torch.arange(text_data.size(1)).expand(len(text_lengths), text_data.size(1)) >= torch.tensor(text_lengths).unsqueeze(1)
+            snippet_mask = torch.arange(audio_snippets.size(1)).expand(len(snippet_lengths), audio_snippets.size(1)) >= torch.tensor(snippet_lengths).unsqueeze(1)
+
+            audio_data = audio_data.cuda()
+            text_data = text_data.cuda()
+            audio_snippets = audio_snippets.cuda()
+            audio_mask = audio_mask.cuda()
+            text_mask = text_mask.cuda()
+            snippet_mask = snippet_mask.cuda()
+
+            timesteps = torch.randint(
+                0, 1000, (audio_data.shape[0],), device='cuda',
+                dtype=torch.int64
+            )
+
+            noise = torch.randn(audio_data.shape, device='cuda')
+
+            noisy_audio = noise_scheduler.add_noise(audio_data, noise, timesteps)
+
+            noise_predicted = audio_model(audio_snippets, text_data, audio_data, snippet_mask, text_mask, audio_mask)
+
+            loss = F.mse_loss(noise_predicted, noise)
+            loss.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            optimizer.zero_grad()
+            
+            print(f"Epoch {epoch}, Step {i_step}, Loss: {loss.item()}")
