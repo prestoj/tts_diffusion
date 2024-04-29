@@ -116,13 +116,15 @@ class AudioLayer(nn.Module):
         return audio_tokens
 
 class AudioModel(nn.Module):
-    def __init__(self, voice_encoder, text_encoder, d_model, nhead, num_layers, dropout=0.1):
+    def __init__(self, voice_encoder, text_encoder, d_model, nhead, num_layers, num_train_timesteps, dropout=0.1):
         super(AudioModel, self).__init__()
         self.nhead = nhead
         self.voice_encoder = voice_encoder
         self.text_encoder = text_encoder
         self.audio_token_linear_in = nn.Linear(1000, d_model)
         self.positional_encoding = PositionalEncoding(d_model)
+
+        self.time_encoding = nn.Embedding(num_train_timesteps, d_model)
 
         self.voice_keys = nn.Linear(d_model, d_model)
         self.voice_values = nn.Linear(d_model, d_model)
@@ -135,13 +137,16 @@ class AudioModel(nn.Module):
         
         self.audio_token_linear_out = nn.Linear(d_model, 1000)
 
-    def forward(self, voice_input, text_input, audio_tokens, voice_mask=None, text_mask=None, audio_mask=None):
+    def forward(self, voice_input, text_input, audio_tokens, timestep, voice_mask=None, text_mask=None, audio_mask=None):
+        N = voice_input.size(0)
         # Voice encoding
         voice_encoding = self.voice_encoder(voice_input, mask=voice_mask)  # (batch_size, d_model)
         voice_encoding = voice_encoding.unsqueeze(1)  # (batch_size, 1, d_model)
 
         # Text encoding
         text_encoding = self.text_encoder(text_input, mask=text_mask)  # (batch_size, num_text, d_model)
+
+        timestep_token = self.time_encoding(timestep)  # (batch_size, d_model)
 
         # Audio token projection
         audio_token_input = self.audio_token_linear_in(audio_tokens)  # (batch_size, num_audio_tokens, d_model)
@@ -160,25 +165,35 @@ class AudioModel(nn.Module):
         if text_mask is not None:
             voice_text_mask = torch.cat((torch.zeros(text_mask.size(0), 1).bool().cuda(), text_mask), dim=1)
 
+        
+        audio_and_time_mask = None
+        if audio_mask is not None:
+            audio_and_time_mask = torch.cat([torch.zeros(N, 1).bool().to(audio_mask.device), audio_mask], dim=1)
+
         combined_attn_mask = None
-        if voice_text_mask is not None and audio_mask is not None:
-            N, L, S = audio_mask.shape[0], audio_mask.shape[1], voice_text_mask.shape[1]
-            # Expand the audio mask and voice/text mask to include the number of heads
-            audio_mask_expanded = audio_mask.unsqueeze(1).expand(N, self.nhead, L).reshape(N*self.nhead, L, 1)
+        if voice_text_mask is not None and audio_and_time_mask is not None:
+            L, S = audio_and_time_mask.shape[1], voice_text_mask.shape[1]
+
+            # Expand the prepended audio mask and voice/text mask to include the number of heads
+            audio_mask_expanded = audio_and_time_mask.unsqueeze(1).expand(N, self.nhead, L).reshape(N*self.nhead, L, 1)
             voice_text_mask_expanded = voice_text_mask.unsqueeze(1).expand(N, self.nhead, S).reshape(N*self.nhead, 1, S)
+            
             # Combine the expanded masks using logical OR
             combined_attn_mask = audio_mask_expanded | voice_text_mask_expanded
-
+            
             # Convert the mask to use zeros and negative infinities
             combined_attn_mask = combined_attn_mask.float()
             combined_attn_mask = combined_attn_mask.masked_fill(combined_attn_mask == 1, float('-1e9'))
 
+        audio_and_time_tokens_input = torch.cat((timestep_token.unsqueeze(1), audio_token_input), dim=1)
 
         for layer in self.layers:
-            audio_token_input = layer(audio_token_input, voice_text_keys, voice_text_values, audio_mask, combined_attn_mask)
+            audio_and_time_tokens_input = layer(audio_and_time_tokens_input, voice_text_keys, voice_text_values, audio_and_time_mask, combined_attn_mask)
             break
+
+        audio_token_output = audio_and_time_tokens_input[:, 1:, :]
     
         # Project audio tokens back to 1000 dimensions
-        audio_token_output = self.audio_token_linear_out(audio_token_input)  # (batch_size, num_audio_tokens, 1000)
+        audio_token_output = self.audio_token_linear_out(audio_token_output)  # (batch_size, num_audio_tokens, 1000)
 
         return audio_token_output

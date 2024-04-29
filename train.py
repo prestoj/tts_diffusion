@@ -11,6 +11,7 @@ from tokenizer import TOKENIZER, INV_TOKENIZER, tokenize_string_random
 from models import VoiceEncoder, TextEncoder, AudioModel
 from diffusers.optimization import get_cosine_schedule_with_warmup
 import random
+import logging
 
 
 class LibriSpeechDataset(Dataset):
@@ -85,22 +86,42 @@ def pad_collate(batch):
     return (padded_audio, padded_text, padded_snippet), (audio_lengths, text_lengths, snippet_lengths)
 
 if __name__ == '__main__':
+    logging.basicConfig(filename='training.log', level=logging.INFO, format='%(message)s')
 
-    voice_encoder = VoiceEncoder(d_model=384, nhead=6, num_layers=4).cuda()
-    text_encoder = TextEncoder(d_model=384, nhead=6, num_layers=4).cuda()
-    audio_model = AudioModel(voice_encoder, text_encoder, d_model=384, nhead=6, num_layers=4).cuda()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    BATCH_SIZE = 64
-    PEAK_LEARNING_RATE = 1e-4
+    voice_encoder = VoiceEncoder(d_model=384, nhead=6, num_layers=4).to(device)
+    text_encoder = TextEncoder(d_model=384, nhead=6, num_layers=4).to(device)
+    audio_model = AudioModel(voice_encoder, text_encoder, d_model=384, nhead=6, num_layers=4, num_train_timesteps=1000).to(device)
+
+    ema_audio_model = AudioModel(voice_encoder, text_encoder, d_model=384, nhead=6, num_layers=4, num_train_timesteps=1000).to(device)
+    ema_voice_encoder = VoiceEncoder(d_model=384, nhead=6, num_layers=4).to(device)
+    ema_text_encoder = TextEncoder(d_model=384, nhead=6, num_layers=4).to(device)
+    ema_audio_model.load_state_dict(audio_model.state_dict())
+    ema_voice_encoder.load_state_dict(voice_encoder.state_dict())
+    ema_text_encoder.load_state_dict(text_encoder.state_dict())
+
+    voice_encoder = nn.DataParallel(voice_encoder)
+    text_encoder = nn.DataParallel(text_encoder)
+    audio_model = nn.DataParallel(audio_model)
+
+    ema_audio_model = nn.DataParallel(ema_audio_model)
+    ema_voice_encoder = nn.DataParallel(ema_voice_encoder)
+    ema_text_encoder = nn.DataParallel(ema_text_encoder)
+
+    BATCH_SIZE = 128
+    PEAK_LEARNING_RATE = 1e-3
     NUM_EPOCHS = 100
+    EMA_DECAY = 0.9998  # EMA decay rate
     
     dataset = LibriSpeechDataset("train.clean.100")
 
     train_dataloader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, collate_fn=pad_collate)
 
     optimizer = torch.optim.AdamW(
-        list(audio_model.parameters()) + list(voice_encoder.parameters()) + list(text_encoder.parameters())
-    , lr=PEAK_LEARNING_RATE)
+        list(audio_model.parameters()) + list(voice_encoder.parameters()) + list(text_encoder.parameters()),
+        lr=PEAK_LEARNING_RATE
+    )
     lr_scheduler = get_cosine_schedule_with_warmup(
         optimizer=optimizer,
         num_warmup_steps=1000,
@@ -122,15 +143,15 @@ if __name__ == '__main__':
             text_mask = torch.arange(text_data.size(1)).expand(len(text_lengths), text_data.size(1)) >= torch.tensor(text_lengths).unsqueeze(1)
             snippet_mask = torch.arange(audio_snippets.size(1)).expand(len(snippet_lengths), audio_snippets.size(1)) >= torch.tensor(snippet_lengths).unsqueeze(1)
 
-            audio_data = audio_data.cuda()
-            text_data = text_data.cuda()
-            audio_snippets = audio_snippets.cuda()
-            audio_mask = audio_mask.cuda()
-            text_mask = text_mask.cuda()
-            snippet_mask = snippet_mask.cuda()
+            audio_data = audio_data.to(device)
+            text_data = text_data.to(device)
+            audio_snippets = audio_snippets.to(device)
+            audio_mask = audio_mask.to(device)
+            text_mask = text_mask.to(device)
+            snippet_mask = snippet_mask.to(device)
 
             timesteps = torch.randint(
-                0, 1000, (audio_data.shape[0],), device='cuda',
+                0, 1000, (audio_data.shape[0],), device=device,
                 dtype=torch.int64
             )
 
@@ -138,12 +159,31 @@ if __name__ == '__main__':
 
             noisy_audio = noise_scheduler.add_noise(audio_data, noise, timesteps)
 
-            noise_predicted = audio_model(audio_snippets, text_data, audio_data, snippet_mask, text_mask, audio_mask)
+            noise_predicted = audio_model(audio_snippets, text_data, audio_data, timesteps, snippet_mask, text_mask, audio_mask)
 
             loss = F.mse_loss(noise_predicted, noise)
             loss.backward()
             optimizer.step()
             lr_scheduler.step()
             optimizer.zero_grad()
-            
-            print(f"Epoch {epoch}, Step {i_step}, Loss: {loss.item()}")
+
+            # Update EMA models
+            for param, ema_param in zip(audio_model.module.parameters(), ema_audio_model.module.parameters()):
+                ema_param.data.mul_(EMA_DECAY).add_(param.data, alpha=1 - EMA_DECAY)
+            for param, ema_param in zip(voice_encoder.module.parameters(), ema_voice_encoder.module.parameters()):
+                ema_param.data.mul_(EMA_DECAY).add_(param.data, alpha=1 - EMA_DECAY)
+            for param, ema_param in zip(text_encoder.module.parameters(), ema_text_encoder.module.parameters()):
+                ema_param.data.mul_(EMA_DECAY).add_(param.data, alpha=1 - EMA_DECAY)
+
+            logging.info(f"Epoch {epoch}, Step {i_step}, Loss: {loss.item()}")
+
+        # Save model
+        torch.save(ema_audio_model.module.state_dict(), f"models/ema_audio_model.pt")
+        torch.save(ema_voice_encoder.module.state_dict(), f"models/ema_voice_encoder.pt")
+        torch.save(ema_text_encoder.module.state_dict(), f"models/ema_text_encoder.pt")
+        
+        if epoch % 10 == 0:
+            torch.save(ema_audio_model.module.state_dict(), f"models/ema_audio_model_epoch_{epoch}.pt")
+            torch.save(ema_voice_encoder.module.state_dict(), f"models/ema_voice_encoder_epoch_{epoch}.pt")
+            torch.save(ema_text_encoder.state_dict(), f"models/ema_text_encoder_epoch_{epoch}.pt")
+
